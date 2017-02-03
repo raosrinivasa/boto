@@ -21,16 +21,37 @@
 # IN THE SOFTWARE.
 import boto
 import boto.jsonresponse
-from boto.compat import json
+from boto.compat import json, six
 from boto.resultset import ResultSet
 from boto.iam.summarymap import SummaryMap
 from boto.connection import AWSQueryConnection
 
-
-ASSUME_ROLE_POLICY_DOCUMENT = json.dumps({
-    'Statement': [{'Principal': {'Service': ['ec2.amazonaws.com']},
-                   'Effect': 'Allow',
-                   'Action': ['sts:AssumeRole']}]})
+DEFAULT_POLICY_DOCUMENTS = {
+    'default': {
+        'Statement': [
+            {
+                'Principal': {
+                    'Service': ['ec2.amazonaws.com']
+                },
+                'Effect': 'Allow',
+                'Action': ['sts:AssumeRole']
+            }
+        ]
+    },
+    'amazonaws.com.cn': {
+        'Statement': [
+            {
+                'Principal': {
+                    'Service': ['ec2.amazonaws.com.cn']
+                },
+                'Effect': 'Allow',
+                'Action': ['sts:AssumeRole']
+            }
+        ]
+    },
+}
+# For backward-compatibility, we'll preserve this here.
+ASSUME_ROLE_POLICY_DOCUMENT = json.dumps(DEFAULT_POLICY_DOCUMENTS['default'])
 
 
 class IAMConnection(AWSQueryConnection):
@@ -40,16 +61,16 @@ class IAMConnection(AWSQueryConnection):
     def __init__(self, aws_access_key_id=None, aws_secret_access_key=None,
                  is_secure=True, port=None, proxy=None, proxy_port=None,
                  proxy_user=None, proxy_pass=None, host='iam.amazonaws.com',
-                 debug=0, https_connection_factory=None, path='/', 
+                 debug=0, https_connection_factory=None, path='/',
                  security_token=None, validate_certs=True, profile_name=None):
         super(IAMConnection, self).__init__(aws_access_key_id,
-                                    aws_secret_access_key,
-                                    is_secure, port, proxy,
-                                    proxy_port, proxy_user, proxy_pass,
-                                    host, debug, https_connection_factory,
-                                    path, security_token,
-                                    validate_certs=validate_certs,
-                                    profile_name=profile_name)
+                                            aws_secret_access_key,
+                                            is_secure, port, proxy,
+                                            proxy_port, proxy_user, proxy_pass,
+                                            host, debug, https_connection_factory,
+                                            path, security_token,
+                                            validate_certs=validate_certs,
+                                            profile_name=profile_name)
 
     def _required_auth_capability(self):
         return ['hmac-v4']
@@ -679,7 +700,7 @@ class IAMConnection(AWSQueryConnection):
     #
 
     def list_server_certs(self, path_prefix='/',
-                             marker=None, max_items=None):
+                          marker=None, max_items=None):
         """
         Lists the server certificates that have the specified path prefix.
         If none exist, the action returns an empty list.
@@ -1006,13 +1027,35 @@ class IAMConnection(AWSQueryConnection):
         :param service: Default service to go to in the console.
         """
         alias = self.get_account_alias()
+
         if not alias:
             raise Exception('No alias associated with this account.  Please use iam.create_account_alias() first.')
 
+        resp = alias.get('list_account_aliases_response', {})
+        result = resp.get('list_account_aliases_result', {})
+        aliases = result.get('account_aliases', [])
+
+        if not len(aliases):
+            raise Exception('No alias associated with this account.  Please use iam.create_account_alias() first.')
+
+        # We'll just use the first one we find.
+        alias = aliases[0]
+
         if self.host == 'iam.us-gov.amazonaws.com':
-            return "https://%s.signin.amazonaws-us-gov.com/console/%s" % (alias, service)
+            return "https://%s.signin.amazonaws-us-gov.com/console/%s" % (
+                alias,
+                service
+            )
+        elif self.host.endswith('amazonaws.com.cn'):
+            return "https://%s.signin.amazonaws.cn/console/%s" % (
+                alias,
+                service
+            )
         else:
-            return "https://%s.signin.aws.amazon.com/console/%s" % (alias, service)
+            return "https://%s.signin.aws.amazon.com/console/%s" % (
+                alias,
+                service
+            )
 
     def get_account_summary(self):
         """
@@ -1059,6 +1102,30 @@ class IAMConnection(AWSQueryConnection):
             params['Path'] = path
         return self.get_response('CreateInstanceProfile', params)
 
+    def _build_policy(self, assume_role_policy_document=None):
+        if assume_role_policy_document is not None:
+            if isinstance(assume_role_policy_document, six.string_types):
+                # Historically, they had to pass a string. If it's a string,
+                # assume the user has already handled it.
+                return assume_role_policy_document
+        else:
+
+            for tld, policy in DEFAULT_POLICY_DOCUMENTS.items():
+                if tld is 'default':
+                    # Skip the default. We'll fall back to it if we don't find
+                    # anything.
+                    continue
+
+                if self.host and self.host.endswith(tld):
+                    assume_role_policy_document = policy
+                    break
+
+            if not assume_role_policy_document:
+                assume_role_policy_document = DEFAULT_POLICY_DOCUMENTS['default']
+
+        # Dump the policy (either user-supplied ``dict`` or one of the defaults)
+        return json.dumps(assume_role_policy_document)
+
     def create_role(self, role_name, assume_role_policy_document=None, path=None):
         """
         Creates a new role for your AWS account.
@@ -1070,21 +1137,19 @@ class IAMConnection(AWSQueryConnection):
         :type role_name: string
         :param role_name: Name of the role to create.
 
-        :type assume_role_policy_document: string
+        :type assume_role_policy_document: ``string`` or ``dict``
         :param assume_role_policy_document: The policy that grants an entity
             permission to assume the role.
 
         :type path: string
-        :param path: The path to the instance profile.
+        :param path: The path to the role.
         """
-        params = {'RoleName': role_name}
-        if assume_role_policy_document is None:
-            # This is the only valid assume_role_policy_document currently, so
-            # this is used as a default value if no assume_role_policy_document
-            # is provided.
-            params['AssumeRolePolicyDocument'] =  ASSUME_ROLE_POLICY_DOCUMENT
-        else:
-            params['AssumeRolePolicyDocument'] =  assume_role_policy_document
+        params = {
+            'RoleName': role_name,
+            'AssumeRolePolicyDocument': self._build_policy(
+                assume_role_policy_document
+            ),
+        }
         if path is not None:
             params['Path'] = path
         return self.get_response('CreateRole', params)
@@ -1134,8 +1199,8 @@ class IAMConnection(AWSQueryConnection):
         :param instance_profile_name: Name of the instance profile to get
             information about.
         """
-        return self.get_response('GetInstanceProfile', {'InstanceProfileName':
-                                                       instance_profile_name})
+        return self.get_response('GetInstanceProfile',
+                                 {'InstanceProfileName': instance_profile_name})
 
     def get_role(self, role_name):
         """
@@ -1375,7 +1440,7 @@ class IAMConnection(AWSQueryConnection):
         Lists the SAML providers in the account.
         This operation requires `Signature Version 4`_.
         """
-        return self.get_response('ListSAMLProviders', {})
+        return self.get_response('ListSAMLProviders', {}, list_marker='SAMLProviderList')
 
     def get_saml_provider(self, saml_provider_arn):
         """
@@ -1388,7 +1453,7 @@ class IAMConnection(AWSQueryConnection):
             provider to get information about.
 
         """
-        params = {'SAMLProviderArn': saml_provider_arn }
+        params = {'SAMLProviderArn': saml_provider_arn}
         return self.get_response('GetSAMLProvider', params)
 
     def update_saml_provider(self, saml_provider_arn, saml_metadata_document):
@@ -1431,5 +1496,437 @@ class IAMConnection(AWSQueryConnection):
             provider to delete.
 
         """
-        params = {'SAMLProviderArn': saml_provider_arn }
+        params = {'SAMLProviderArn': saml_provider_arn}
         return self.get_response('DeleteSAMLProvider', params)
+
+    #
+    # IAM Reports
+    #
+
+    def generate_credential_report(self):
+        """
+        Generates a credential report for an account
+
+        A new credential report can only be generated every 4 hours. If one
+        hasn't been generated in the last 4 hours then get_credential_report
+        will error when called
+        """
+        params = {}
+        return self.get_response('GenerateCredentialReport', params)
+
+    def get_credential_report(self):
+        """
+        Retrieves a credential report for an account
+
+        A report must have been generated in the last 4 hours to succeed.
+        The report is returned as a base64 encoded blob within the response.
+        """
+        params = {}
+        return self.get_response('GetCredentialReport', params)
+
+    def create_virtual_mfa_device(self, path, device_name):
+        """
+        Creates a new virtual MFA device for the AWS account.
+
+        After creating the virtual MFA, use enable-mfa-device to
+        attach the MFA device to an IAM user.
+
+        :type path: string
+        :param path: The path for the virtual MFA device.
+
+        :type device_name: string
+        :param device_name: The name of the virtual MFA device.
+            Used with path to uniquely identify a virtual MFA device.
+
+        """
+        params = {
+            'Path': path,
+            'VirtualMFADeviceName': device_name
+        }
+        return self.get_response('CreateVirtualMFADevice', params)
+
+    #
+    # IAM password policy
+    #
+
+    def get_account_password_policy(self):
+        """
+        Returns the password policy for the AWS account.
+        """
+        params = {}
+        return self.get_response('GetAccountPasswordPolicy', params)
+
+    def delete_account_password_policy(self):
+        """
+        Delete the password policy currently set for the AWS account.
+        """
+        params = {}
+        return self.get_response('DeleteAccountPasswordPolicy', params)
+
+    def update_account_password_policy(self, allow_users_to_change_password=None,
+                                        hard_expiry=None, max_password_age=None ,
+                                        minimum_password_length=None ,
+                                        password_reuse_prevention=None,
+                                        require_lowercase_characters=None,
+                                        require_numbers=None, require_symbols=None ,
+                                        require_uppercase_characters=None):
+        """
+        Update the password policy for the AWS account.
+
+        Notes: unset parameters will be reset to Amazon default settings!
+            Most of the password policy settings are enforced the next time your users
+            change their passwords. When you set minimum length and character type
+            requirements, they are enforced the next time your users change their
+            passwords - users are not forced to change their existing passwords, even
+            if the pre-existing passwords do not adhere to the updated password
+            policy. When you set a password expiration period, the expiration period
+            is enforced immediately.
+
+        :type allow_users_to_change_password: bool
+        :param allow_users_to_change_password: Allows all IAM users in your account
+            to use the AWS Management Console to change their own passwords.
+
+        :type hard_expiry: bool
+        :param hard_expiry: Prevents IAM users from setting a new password after
+            their password has expired.
+
+        :type max_password_age: int
+        :param max_password_age: The number of days that an IAM user password is valid.
+
+        :type minimum_password_length: int
+        :param minimum_password_length: The minimum number of characters allowed in
+            an IAM user password.
+
+        :type password_reuse_prevention: int
+        :param password_reuse_prevention: Specifies the number of previous passwords
+            that IAM users are prevented from reusing.
+
+        :type require_lowercase_characters: bool
+        :param require_lowercase_characters: Specifies whether IAM user passwords
+            must contain at least one lowercase character from the ISO basic Latin
+            alphabet (``a`` to ``z``).
+
+        :type require_numbers: bool
+        :param require_numbers: Specifies whether IAM user passwords must contain at
+            least one numeric character (``0`` to ``9``).
+
+        :type require_symbols: bool
+        :param require_symbols: Specifies whether IAM user passwords must contain at
+            least one of the following non-alphanumeric characters:
+            ``! @ # $ % ^ & * ( ) _ + - = [ ] { } | '``
+
+        :type require_uppercase_characters: bool
+        :param require_uppercase_characters: Specifies whether IAM user passwords
+            must contain at least one uppercase character from the ISO basic Latin
+            alphabet (``A`` to ``Z``).
+        """
+        params = {}
+        if allow_users_to_change_password is not None and type(allow_users_to_change_password) is bool:
+            params['AllowUsersToChangePassword'] = str(allow_users_to_change_password).lower()
+        if hard_expiry is not None and type(allow_users_to_change_password) is bool:
+            params['HardExpiry'] = str(hard_expiry).lower()
+        if max_password_age is not None:
+            params['MaxPasswordAge'] = max_password_age
+        if minimum_password_length is not None:
+            params['MinimumPasswordLength'] = minimum_password_length
+        if password_reuse_prevention is not None:
+            params['PasswordReusePrevention'] = password_reuse_prevention
+        if require_lowercase_characters is not None and type(allow_users_to_change_password) is bool:
+            params['RequireLowercaseCharacters'] = str(require_lowercase_characters).lower()
+        if require_numbers is not None and type(allow_users_to_change_password) is bool:
+            params['RequireNumbers'] = str(require_numbers).lower()
+        if require_symbols is not None and type(allow_users_to_change_password) is bool:
+            params['RequireSymbols'] = str(require_symbols).lower()
+        if require_uppercase_characters is not None and type(allow_users_to_change_password) is bool:
+            params['RequireUppercaseCharacters'] = str(require_uppercase_characters).lower()
+        return self.get_response('UpdateAccountPasswordPolicy', params)
+
+    def create_policy(self, policy_name, policy_document, path='/',
+                      description=None):
+        """
+        Create a policy.
+
+        :type policy_name: string
+        :param policy_name: The name of the new policy
+
+        :type policy_document string
+        :param policy_document: The document of the new policy
+
+        :type path: string
+        :param path: The path in which the policy will be created.
+            Defaults to /.
+
+        :type description: string
+        :param path: A description of the new policy.
+
+        """
+        params = {'PolicyName': policy_name,
+                  'PolicyDocument': policy_document,
+                  'Path': path}
+        if description is not None:
+            params['Description'] = str(description)
+
+        return self.get_response('CreatePolicy', params)
+
+    def create_policy_version(
+            self,
+            policy_arn,
+            policy_document,
+            set_as_default=None):
+        """
+        Create a policy version.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy
+
+        :type policy_document string
+        :param policy_document: The document of the new policy version
+
+        :type set_as_default: bool
+        :param set_as_default: Sets the policy version as default
+            Defaults to None.
+
+        """
+        params = {'PolicyArn': policy_arn,
+                  'PolicyDocument': policy_document}
+        if type(set_as_default) == bool:
+            params['SetAsDefault'] = str(set_as_default).lower()
+        return self.get_response('CreatePolicyVersion', params)
+
+    def delete_policy(self, policy_arn):
+        """
+        Delete a policy.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to delete
+
+        """
+        params = {'PolicyArn': policy_arn}
+        return self.get_response('DeletePolicy', params)
+
+    def delete_policy_version(self, policy_arn, version_id):
+        """
+        Delete a policy version.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to delete a version from
+
+        :type version_id: string
+        :param version_id: The id of the version to delete
+
+        """
+        params = {'PolicyArn': policy_arn,
+                  'VersionId': version_id}
+        return self.get_response('DeletePolicyVersion', params)
+
+    def get_policy(self, policy_arn):
+        """
+        Get policy information.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to get information for
+
+        """
+        params = {'PolicyArn': policy_arn}
+        return self.get_response('GetPolicy', params)
+
+    def get_policy_version(self, policy_arn, version_id):
+        """
+        Get policy information.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to get information for a
+            specific version
+
+        :type version_id: string
+        :param version_id: The id of the version to get information for
+
+        """
+        params = {'PolicyArn': policy_arn,
+                  'VersionId': version_id}
+        return self.get_response('GetPolicyVersion', params)
+
+    def list_policies(self, marker=None, max_items=None, only_attached=None,
+                      path_prefix=None, scope=None):
+        """
+        List policies of account.
+
+        :type marker: string
+        :param marker: A marker used for pagination (received from previous
+            accesses)
+
+        :type max_items: int
+        :param max_items: Send only max_items; allows paginations
+
+        :type only_attached: bool
+        :param only_attached: Send only policies attached to other resources
+
+        :type path_prefix: string
+        :param path_prefix: Send only items prefixed by this path
+
+        :type scope: string
+        :param scope: AWS|Local.  Choose between AWS policies or your own
+        """
+        params = {}
+        if path_prefix is not None:
+            params['PathPrefix'] = path_prefix
+        if marker is not None:
+            params['Marker'] = marker
+        if max_items is not None:
+            params['MaxItems'] = max_items
+        if type(only_attached) == bool:
+            params['OnlyAttached'] = str(only_attached).lower()
+        if scope is not None:
+            params['Scope'] = scope
+        return self.get_response(
+            'ListPolicies',
+            params,
+            list_marker='Policies')
+
+    def list_policy_versions(self, policy_arn, marker=None, max_items=None):
+        """
+        List policy versions.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to get versions of
+
+        :type marker: string
+        :param marker: A marker used for pagination (received from previous
+            accesses)
+
+        :type max_items: int
+        :param max_items: Send only max_items; allows paginations
+
+        """
+        params = {'PolicyArn': policy_arn}
+        if marker is not None:
+            params['Marker'] = marker
+        if max_items is not None:
+            params['MaxItems'] = max_items
+        return self.get_response(
+            'ListPolicyVersions',
+            params,
+            list_marker='Versions')
+
+    def set_default_policy_version(self, policy_arn, version_id):
+        """
+        Set default policy version.
+
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to set the default version
+            for
+
+        :type version_id: string
+        :param version_id: The id of the version to set as default
+        """
+        params = {'PolicyArn': policy_arn,
+                  'VersionId': version_id}
+        return self.get_response('SetDefaultPolicyVersion', params)
+
+    def list_entities_for_policy(self, policy_arn, path_prefix=None,
+                                 marker=None, max_items=None,
+                                 entity_filter=None):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to get entities for
+
+        :type marker: string
+        :param marker: A marker used for pagination (received from previous
+            accesses)
+
+        :type max_items: int
+        :param max_items: Send only max_items; allows paginations
+
+        :type path_prefix: string
+        :param path_prefix: Send only items prefixed by this path
+
+        :type entity_filter: string
+        :param entity_filter: Which entity type of User | Role | Group |
+            LocalManagedPolicy | AWSManagedPolicy to return
+
+        """
+        params = {'PolicyArn': policy_arn}
+        if marker is not None:
+            params['Marker'] = marker
+        if max_items is not None:
+            params['MaxItems'] = max_items
+        if path_prefix is not None:
+            params['PathPrefix'] = path_prefix
+        if entity_filter is not None:
+            params['EntityFilter'] = entity_filter
+        return self.get_response('ListEntitiesForPolicy', params,
+                                 list_marker=('PolicyGroups',
+                                              'PolicyUsers',
+                                              'PolicyRoles'))
+
+    def attach_group_policy(self, policy_arn, group_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to attach
+
+        :type group_name: string
+        :param group_name: Group to attach the policy to
+
+        """
+        params = {'PolicyArn': policy_arn, 'GroupName': group_name}
+        return self.get_response('AttachGroupPolicy', params)
+
+    def attach_role_policy(self, policy_arn, role_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to attach
+
+        :type role_name: string
+        :param role_name: Role to attach the policy to
+
+        """
+        params = {'PolicyArn': policy_arn, 'RoleName': role_name}
+        return self.get_response('AttachRolePolicy', params)
+
+    def attach_user_policy(self, policy_arn, user_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to attach
+
+        :type user_name: string
+        :param user_name: User to attach the policy to
+
+        """
+        params = {'PolicyArn': policy_arn, 'UserName': user_name}
+        return self.get_response('AttachUserPolicy', params)
+
+    def detach_group_policy(self, policy_arn, group_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to detach
+
+        :type group_name: string
+        :param group_name: Group to detach the policy from
+
+        """
+        params = {'PolicyArn': policy_arn, 'GroupName': group_name}
+        return self.get_response('DetachGroupPolicy', params)
+
+    def detach_role_policy(self, policy_arn, role_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to detach
+
+        :type role_name: string
+        :param role_name: Role to detach the policy from
+
+        """
+        params = {'PolicyArn': policy_arn, 'RoleName': role_name}
+        return self.get_response('DetachRolePolicy', params)
+
+    def detach_user_policy(self, policy_arn, user_name):
+        """
+        :type policy_arn: string
+        :param policy_arn: The ARN of the policy to detach
+
+        :type user_name: string
+        :param user_name: User to detach the policy from
+
+        """
+        params = {'PolicyArn': policy_arn, 'UserName': user_name}
+        return self.get_response('DetachUserPolicy', params)
